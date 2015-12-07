@@ -1,0 +1,174 @@
+application:
+  interfaces:
+    endpoints:
+      "*": bind(workflow#result.*)
+    docker:
+      "*": "bind(docker#docker.*)"
+  bindings:
+  - [docker#host, workflow]
+  - [docker#credentials, workflow]
+  components:
+    docker:
+      type: cobalt.docker.Service
+    workflow:
+      type: workflow.Instance
+      interfaces:
+        result:
+          address:            publish-signal(string)
+          client-key:         publish-signal(string)
+          client-certificate: publish-signal(string)
+          ca-certificate:     publish-signal(string)
+          hosts:              publish-signal(list<string>)
+      configuration:
+        configuration.workflows:
+          launch: 
+            steps:
+              - provisionNodes:
+                  action: provisionVms
+                  parameters:
+                    imageId: us-west-2/ami-f0091d91
+                    hardwareId: m3.medium
+                    vmIdentity: ec2-user
+                    targetQuantity: 2
+                    roleName: docker
+                    blockDeviceMapping:
+                      "/dev/xvda":
+                        ebs:
+                          volumeSize: 15
+                          deleteOnTermination: true
+                    providerSettings:
+                      userData: &userData
+                        |
+                        #cloud-config
+                        packages:
+                        - docker
+                        runcmd:
+                        - curl https://get.docker.com/builds/Linux/x86_64/docker-1.9.1 > /usr/bin/docker
+                  output:
+                    nodesIps: ips
+              - provisionMaster:
+                  action: provisionVms
+                  parameters:
+                    imageId: us-west-2/ami-f0091d91
+                    hardwareId: m3.medium
+                    vmIdentity: ec2-user
+                    targetQuantity: 1
+                    roleName: master
+                    providerSettings:
+                      userData: *userData
+                  output:
+                    masterIps: ips
+              - generateCertificates:
+                  action: execrun
+                  precedingPhases: [ provisionMaster ]
+                  parameters:
+                    isSudo: true
+                    roles: [ master ]
+                    command:
+                      - |
+                        mkdir -p certs
+                        cd certs
+                        echo 01 > ca.srl
+                        openssl genrsa -out ca-key.pem     2048
+                        openssl genrsa -out server-key.pem 2048
+                        openssl genrsa -out client-key.pem 2048
+                        openssl req -new -nodes -x509 -days 3650 -subj '/O=Docker' -key ca-key.pem -out ca.pem
+                        openssl req -new -nodes -subj '/CN=*' -key server-key.pem -out server.csr
+                        echo 'subjectAltName = IP:{$.masterIps[0]}' > extfile.cnf
+                        echo 'extendedKeyUsage = serverAuth,clientAuth' >> extfile.cnf
+                        openssl x509 -req -days 365 -in server.csr -CA ca.pem -CAkey ca-key.pem -out server-cert.pem -extfile extfile.cnf
+                        openssl req -new -nodes -subj '/CN=client' -key client-key.pem -out client.csr
+                        echo 'extendedKeyUsage = clientAuth' > extfile.cnf
+                        openssl x509 -req -days 365 -in client.csr -CA ca.pem -CAkey ca-key.pem -out client-cert.pem -extfile extfile.cnf
+              - getCA:
+                  action: execrun
+                  precedingPhases: [ generateCertificates ]
+                  parameters:
+                    isSudo: true
+                    roles: [ master ]
+                    command:
+                      - |
+                        cat certs/ca-key.pem >&2
+                        cat certs/ca.pem
+                  output:
+                    ca: stdout
+                    ca-key: stderr
+              - generateNodeCertificates:
+                  action: execrun
+                  precedingPhases: [ provisionNodes, getCA ]
+                  parameters:
+                    isSudo: true
+                    roles: [ docker ]
+                    command:
+                      - |
+                        mkdir -p certs
+                        cd certs
+                        cat <<EEND > ca.pem
+                        {$.ca.*[0]}
+                        EEND
+                        cat <<EEND > ca-key.pem
+                        {$.ca-key.*[0]}
+                        EEND
+                        echo 02 > ca.srl
+                        openssl genrsa -out server-key.pem 2048
+                        openssl req -new -nodes -subj '/CN=*' -key server-key.pem -out server.csr
+                        echo "subjectAltName = IP:$$(hostname -i)" > extfile.cnf
+                        openssl x509 -req -days 365 -in server.csr -CA ca.pem -CAkey ca-key.pem -out server-cert.pem -extfile extfile.cnf
+              - moveCertificates:
+                  action: execrun
+                  precedingPhases: [ generateNodeCertificates ]
+                  parameters:
+                    isSudo: true
+                    roles: [ master, docker ]
+                    command:
+                      - |
+                        mkdir -p /var/ssl
+                        cp certs/ca.pem certs/server-cert.pem certs/server-key.pem /var/ssl/
+              - prepareMaster:
+                  action: execrun
+                  precedingPhases: [ moveCertificates ]
+                  parameters:
+                    isSudo: true
+                    roles: [ master ]
+                    command:
+                      - |
+                        service docker start
+                        docker run -d -p 4001:4001 -p 7001:7001 -v /data microbox/etcd:latest etcd
+                        docker run -d -p 2376:2375 -v /var/ssl:/.swarm swarm manage --tlsverify --tlscacert=/.swarm/ca.pem --tlscert=/.swarm/server-cert.pem --tlskey=/.swarm/server-key.pem etcd://{$.masterIps[0]}:4001
+              - prepareNodes:
+                  action: execrun
+                  precedingPhases: [ prepareMaster ]
+                  parameters:
+                    isSudo: true
+                    roles: [ docker ]
+                    command:
+                      - |
+                        echo 'OPTIONS="$$OPTIONS -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock"' >> /etc/sysconfig/docker
+                        echo 'OPTIONS="$$OPTIONS --cluster-store=etcd://{$.masterIps[0]}:4001 --cluster-advertise=eth0:2376"' >> /etc/sysconfig/docker
+                        echo 'OPTIONS="$$OPTIONS --tlsverify --tlscacert=/var/ssl/ca.pem --tlscert=/var/ssl/server-cert.pem --tlskey=/var/ssl/server-key.pem"' >> /etc/sysconfig/docker
+                        service docker start
+                        docker run -d swarm join --addr=$$(hostname -i):2375 etcd://{$.masterIps[0]}:4001
+              - getCertificates:
+                  action: execrun
+                  precedingPhases: [ getCA ]
+                  parameters:
+                    roles: [ master ]
+                    isSudo: true
+                    command:
+                      - |
+                        cat certs/client-cert.pem
+                        cat certs/client-key.pem >&2
+                  output:
+                    c-cert: stdout
+                    c-key: stderr
+            return:
+              address:
+                value: "{$.masterIps[0]}"
+              client-key:
+                value: "{$.c-key.*[0]}"
+              client-certificate:
+                value: "{$.c-cert.*[0]}"
+              ca-certificate:
+                value: "{$.ca.*[0]}"
+              hosts:
+                value: "{$.nodesIps}"
